@@ -1,0 +1,62 @@
+// Package gen is the public interface of the gen component: it orchestrates the
+// pipeline spec -> prompt -> claude -> architecture and writes the resulting
+// goforge component to disk.
+//
+// gen is a non-deterministic brick with input and output effects: it calls the
+// network (via the claude brick) and writes files.
+package gen
+
+import (
+	"context"
+
+	"goforge.dev/cupel/components/architecture"
+	"goforge.dev/cupel/components/gen/internal"
+	"goforge.dev/cupel/components/prompt"
+	"goforge.dev/cupel/components/spec"
+)
+
+// Completer is the slice of the claude client gen needs: anything that can turn
+// a system+user prompt into a reply. claude.Client satisfies it. Accepting an
+// interface keeps gen testable without the network.
+type Completer interface {
+	Complete(ctx context.Context, system, user string) (string, error)
+}
+
+// Request describes one generation run.
+type Request struct {
+	Spec   spec.Spec
+	Module string // workspace module path, e.g. goforge.dev/myapp
+	Root   string // workspace root directory (contains components/)
+	Force  bool   // overwrite scaffolding (interface/internal/yaml) if present
+	DryRun bool   // render everything but write nothing
+}
+
+// Result reports what happened.
+type Result struct {
+	ComponentDir string   // components/<name> under Root
+	Written      []string // absolute paths written
+	Skipped      []string // scaffold files left untouched (already existed)
+	Raw          string   // unmodified model reply
+}
+
+// Generate runs the full pipeline for req using completer cl.
+func Generate(ctx context.Context, cl Completer, req Request) (Result, error) {
+	raw, err := cl.Complete(ctx, prompt.System(), prompt.User(req.Spec))
+	if err != nil {
+		return Result{}, err
+	}
+
+	formatted, err := architecture.EnforceTests(req.Spec, raw)
+	if err != nil {
+		return Result{Raw: raw}, err
+	}
+
+	files := architecture.Brick(req.Spec, req.Module, formatted)
+	plan := make([]internal.File, len(files))
+	for i, f := range files {
+		plan[i] = internal.File{RelPath: f.RelPath, Content: f.Content, Generated: f.Generated}
+	}
+
+	dir, written, skipped, err := internal.Write(req.Root, req.Spec.Name, plan, req.Force, req.DryRun)
+	return Result{ComponentDir: dir, Written: written, Skipped: skipped, Raw: raw}, err
+}

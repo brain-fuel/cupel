@@ -1,0 +1,10 @@
+# Bricks this project includes. Kept in sync with the imports reachable from
+# main.go; `goforge check` verifies declared bricks match the effective ones.
+bricks:
+  - cli
+  - gen
+  - claude
+  - claudecode
+  - prompt
+  - architecture
+  - spec

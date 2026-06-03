@@ -1,0 +1,29 @@
+// Package prompt is the public interface of the prompt component. It turns a
+// validated spec into the system and user messages sent to Claude, instructing
+// the model to emit a single Go test file containing example tests,
+// parameterized/data-driven (table) tests, and property-based tests.
+//
+// prompt is a deterministic, pure brick: the same spec always yields the same
+// messages.
+package prompt
+
+import (
+	"goforge.dev/cupel/components/prompt/internal"
+	"goforge.dev/cupel/components/spec"
+)
+
+// System returns the system prompt. It is constant and large, so callers should
+// send it with prompt caching enabled (see the claude component).
+func System() string { return internal.System }
+
+// User builds the user message for a given spec: the English specification plus
+// the exact output contract (package name, the three required test categories,
+// gofmt-clean, standard-library only).
+func User(s spec.Spec) string {
+	return internal.User(internal.SpecView{
+		Name:        s.Name,
+		Interface:   s.Interface,
+		TestPackage: s.TestPackage(),
+		Text:        s.Text,
+	})
+}
