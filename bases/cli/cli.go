@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
+	"sort"
 	"strings"
 
 	"goforge.dev/cupel/components/claude"
@@ -26,6 +28,10 @@ type completer interface {
 	Complete(ctx context.Context, system, user string) (string, error)
 	Model() string
 }
+
+// Version is stamped by release builds. Go-installed binaries fall back to the
+// module version recorded in build info.
+var Version = "dev"
 
 const usage = `cupel — generate example, table-driven, and property-based Go tests from an
 English specification, written into a goforge component and validated against
@@ -51,6 +57,8 @@ Flags:
   :force           overwrite scaffold files (interface/internal/component.yaml)
   :dry-run         render everything but write nothing
   :no-check        skip running "goforge check" on the result
+  :help            print this help
+  :version         print the cupel version
 
 Environment:
   ANTHROPIC_API_KEY   required for the api backend
@@ -68,6 +76,14 @@ func run(argv []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if a.flag("help") || a.named["name"] == "" && len(argv) == 0 {
 		fmt.Fprint(stdout, usage)
 		return 0
+	}
+	if a.flag("version") {
+		fmt.Fprintf(stdout, "cupel %s\n", resolvedVersion())
+		return 0
+	}
+	if err := validateArgs(a); err != nil {
+		fmt.Fprintf(stderr, "cupel: %v\n", err)
+		return 2
 	}
 
 	name := a.named["name"]
@@ -229,8 +245,9 @@ func modulePath(root string) (string, error) {
 // --- minimal poly-style argument parsing (key:value and :flag) ---
 
 type args struct {
-	named map[string]string
-	flags map[string]bool
+	named       map[string]string
+	flags       map[string]bool
+	positionals []string
 }
 
 func (a args) flag(name string) bool { return a.flags[name] }
@@ -259,12 +276,70 @@ func parse(argv []string) args {
 	a := args{named: map[string]string{}, flags: map[string]bool{}}
 	for _, tok := range argv {
 		switch {
+		case tok == "help" || tok == "-h" || tok == "--help":
+			a.flags["help"] = true
+		case tok == "version" || tok == "-v" || tok == "--version":
+			a.flags["version"] = true
 		case strings.HasPrefix(tok, ":"):
 			a.flags[tok[1:]] = true
 		case strings.Contains(tok, ":"):
 			k, v, _ := strings.Cut(tok, ":")
 			a.named[k] = v
+		default:
+			a.positionals = append(a.positionals, tok)
 		}
 	}
 	return a
+}
+
+func resolvedVersion() string {
+	if Version != "dev" {
+		return Version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return Version
+}
+
+func validateArgs(a args) error {
+	if len(a.positionals) > 0 {
+		return fmt.Errorf("unexpected argument %q (arguments use key:value or :flag syntax; try: cupel :help)", a.positionals[0])
+	}
+	knownNamed := map[string]bool{
+		"backend":   true,
+		"iface":     true,
+		"model":     true,
+		"name":      true,
+		"root":      true,
+		"spec":      true,
+		"spec-file": true,
+	}
+	knownFlags := map[string]bool{
+		"dry-run":  true,
+		"force":    true,
+		"help":     true,
+		"no-check": true,
+		"version":  true,
+	}
+	for _, k := range sortedKeys(a.named) {
+		if !knownNamed[k] {
+			return fmt.Errorf("unknown argument %q (try: cupel :help)", k+":")
+		}
+	}
+	for _, f := range sortedKeys(a.flags) {
+		if !knownFlags[f] {
+			return fmt.Errorf("unknown flag %q (try: cupel :help)", ":"+f)
+		}
+	}
+	return nil
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
