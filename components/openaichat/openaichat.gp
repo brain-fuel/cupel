@@ -1,0 +1,51 @@
+// Package openaichat is the public interface of the openaichat component: a thin
+// client for the OpenAI Chat Completions wire format
+// (POST {baseURL}/chat/completions). Because that format is the de-facto
+// standard, one client reaches OpenAI and Codex, a local Ollama, LM Studio or
+// vLLM server, and any other OpenAI-compatible endpoint. It satisfies the same
+// gen.Completer contract as the claude and claudecode backends.
+//
+// openaichat is a non-deterministic brick with input and output effects: it
+// reads configuration from the environment and sends a request over the network
+// whose reply varies between calls.
+package openaichat
+
+import (
+	"context"
+
+	"goforge.dev/cupel/components/openaichat/internal"
+)
+
+// Provider names understood natively; any other value is a custom
+// OpenAI-compatible provider that supplies its own base URL.
+const (
+	ProviderOpenAI = internal.ProviderOpenAI
+	ProviderOllama = internal.ProviderOllama
+)
+
+// Client talks to an OpenAI-compatible Chat Completions endpoint.
+type Client struct{ impl internal.Client }
+
+// New builds a Client for the given provider, model, and base URL. Empty values
+// fall back to the environment (CUPEL_PROVIDER, CUPEL_BASE_URL, CUPEL_MODEL,
+// OPENAI_API_KEY) and then to provider defaults. The precedence is always
+// explicit argument > environment > default. An API key is required only for
+// the hosted OpenAI endpoint; local servers may run without one.
+func New(provider, model, baseURL string) (Client, error) {
+	impl, err := internal.New(provider, model, baseURL)
+	return Client{impl: impl}, err
+}
+
+// Model reports the model the client will call.
+func (c Client) Model() string { return c.impl.Model }
+
+// Provider reports the resolved provider name.
+func (c Client) Provider() string { return c.impl.Provider }
+
+// BaseURL reports the resolved API root (without the /chat/completions suffix).
+func (c Client) BaseURL() string { return c.impl.BaseURL }
+
+// Complete sends system + user as chat messages and returns the assistant reply.
+func (c Client) Complete(ctx context.Context, system, user string) (string, error) {
+	return c.impl.Complete(ctx, system, user)
+}

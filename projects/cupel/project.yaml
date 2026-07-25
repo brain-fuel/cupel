@@ -5,6 +5,7 @@ bricks:
   - gen
   - claude
   - claudecode
+  - openaichat
   - prompt
   - architecture
   - spec

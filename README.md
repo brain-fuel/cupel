@@ -30,6 +30,7 @@ worker-type discipline it enforces on its output:
 | `architecture` | component | `deterministic/pure` — validate/format output, render the brick |
 | `claude`       | component | `non_deterministic/[input_effect, output_effect]` — Anthropic Messages API backend |
 | `claudecode`   | component | `non_deterministic/[input_effect, output_effect]` — local Claude Code CLI backend |
+| `openaichat`   | component | `non_deterministic/[input_effect, output_effect]` — OpenAI-compatible Chat Completions backend (OpenAI/Codex/Ollama/LM Studio/vLLM) |
 | `gen`          | component | `non_deterministic/[input_effect, output_effect]` — orchestrate & write files |
 | `cli`          | base      | the effect boundary (effective: `non_deterministic/[input_effect, output_effect]`) |
 
@@ -49,26 +50,45 @@ go install goforge.dev/goforge@latest                 # needed for the check ste
 Run from inside any goforge workspace. `name:` is the target component.
 
 ```sh
-# api backend (default) — calls the Anthropic API
+# anthropic api (default) — calls the Anthropic API
 export ANTHROPIC_API_KEY=sk-...
 cupel name:user spec:"A user has a non-empty name and an email containing '@'.
 Two users are equal iff their emails match (case-insensitive)."
 
-# cli backend — drives the local Claude Code `claude` CLI instead (no API key)
+# claude code cli — drives the local `claude` CLI instead (no API key)
 cupel name:user backend:cli spec-file:user.md
+
+# openai / codex — any OpenAI-compatible hosted model
+export OPENAI_API_KEY=sk-...
+cupel name:user provider:openai model:gpt-4o spec-file:user.md
+
+# local ollama — no key, defaults to http://localhost:11434/v1
+cupel name:user provider:ollama model:llama3.2 spec-file:user.md
+
+# any other OpenAI-compatible server (LM Studio, vLLM, a proxy): name it and
+# point base-url: at it (key optional for local servers)
+cupel name:user provider:vllm model:mistral base-url:http://localhost:8000/v1 spec-file:user.md
 
 # from stdin
 cat order.md | cupel name:order
 ```
 
-### Backends
+### Providers & backends
 
-| `backend:` | how it generates | needs |
-|------------|------------------|-------|
-| `api` (default) | Anthropic Messages API over HTTP, system prompt cached | `ANTHROPIC_API_KEY` |
-| `cli` | shells out to `claude -p ... --append-system-prompt ...` in headless print mode | Claude Code installed (`claude` on PATH, or `CUPEL_CLAUDE_BIN`) |
+The model is chosen by `provider:` (which API to speak) plus `backend:` (the
+transport). `backend:cli` is Anthropic-only; every other provider uses
+`backend:api` and the OpenAI Chat Completions wire format, which reaches OpenAI,
+Codex, Ollama, LM Studio, vLLM, and any other OpenAI-compatible endpoint.
 
-Both backends feed the identical prompt and the same output enforcement, so the
+| `provider:` | `backend:` | how it generates | needs |
+|-------------|------------|------------------|-------|
+| `anthropic` (default) | `api` (default) | Anthropic Messages API over HTTP, system prompt cached | `ANTHROPIC_API_KEY` |
+| `anthropic` | `cli` | shells out to `claude -p ... --append-system-prompt ...` in headless print mode | Claude Code installed (`claude` on PATH, or `CUPEL_CLAUDE_BIN`) |
+| `openai` | `api` | OpenAI Chat Completions (`POST {base}/chat/completions`) | `OPENAI_API_KEY` |
+| `ollama` | `api` | OpenAI-compatible endpoint on a local Ollama | nothing (base defaults to `http://localhost:11434/v1`) |
+| any custom name | `api` | OpenAI-compatible endpoint you name | `base-url:` (key optional) |
+
+All providers feed the identical prompt and the same output enforcement, so the
 generated tests and the trailing `goforge check` are the same either way.
 
 Arguments (poly-style `key:value` / `:flag`):
@@ -79,12 +99,18 @@ Arguments (poly-style `key:value` / `:flag`):
 | `iface:PKG`      | public package of that component (default `NAME`) |
 | `spec:"TEXT"`    | inline specification |
 | `spec-file:PATH` | read the spec from a file |
-| `backend:WHICH`  | `api` (default) or `cli` (drive the Claude Code CLI) |
-| `model:ID`       | Claude model (`$CUPEL_MODEL`; api default `claude-opus-4-8`, cli default its own) |
+| `provider:WHO`   | `anthropic` (default), `openai`, `ollama`, or any custom OpenAI-compatible name (`$CUPEL_PROVIDER`) |
+| `backend:WHICH`  | `api` (default) or `cli` (drive the Claude Code CLI; anthropic only) |
+| `model:ID`       | model id (`$CUPEL_MODEL`; anthropic api default `claude-opus-4-8`, others per-provider) |
+| `base-url:URL`   | API endpoint override (`$CUPEL_BASE_URL`; e.g. a local server or proxy) |
 | `root:DIR`       | workspace root (default: discovered from cwd) |
 | `:force`         | overwrite the interface/internal/yaml scaffold |
 | `:dry-run`       | render everything, write nothing |
 | `:no-check`      | skip the trailing `goforge check` |
+
+Environment: `CUPEL_PROVIDER`, `CUPEL_BASE_URL`, and `CUPEL_MODEL` set defaults
+for `provider:`, `base-url:`, and `model:`; `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`
+carry credentials (an explicit argument always wins over the environment).
 
 cupel writes `components/<name>/<name>_test.go` (always) and, when the brick
 does not yet exist, a placeholder interface, `internal/core.go`, and

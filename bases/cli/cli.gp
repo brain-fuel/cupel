@@ -1,0 +1,427 @@
+// Package cli is the cupel base: the entry-point layer that wires the spec,
+// claude, and gen components into a runnable command. As a base it is the
+// boundary where effects (argument parsing, stdin, environment, file system,
+// the network, and shelling out to goforge) enter the system.
+package cli
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime/debug"
+	"sort"
+	"strings"
+
+	"goforge.dev/cupel/components/claude"
+	"goforge.dev/cupel/components/claudecode"
+	"goforge.dev/cupel/components/gen"
+	"goforge.dev/cupel/components/openaichat"
+	"goforge.dev/cupel/components/spec"
+)
+
+// completer is a generation backend: it turns a prompt into a reply and can
+// name the model it uses. The claude (API), claudecode (CLI), and openaichat
+// (OpenAI-compatible) clients all satisfy it, and it satisfies gen.Completer.
+type completer interface {
+	Complete(ctx context.Context, system, user string) (string, error)
+	Model() string
+}
+
+// Backend is the transport for the anthropic provider — a genuine two-way
+// closed sum, expressed as a Go+ enum so backendClient must handle both arms.
+// (The provider itself is NOT a closed set: openai/ollama plus any custom
+// OpenAI-compatible name are accepted, so provider stays a free-form string.)
+type Backend enum {
+	// API talks to a provider over HTTP (backend:api).
+	API
+	// CLI drives the local Claude Code "claude" binary (backend:cli).
+	CLI
+}
+
+// parseBackend maps the CLI/env wire string (backend:api | backend:cli) to a
+// Backend. ok is false for any other string, so callers can preserve the exact
+// unknown-backend error text against the raw argument.
+func parseBackend(s string) (Backend, bool) {
+	switch s {
+	case "api":
+		return API, true
+	case "cli":
+		return CLI, true
+	default:
+		return API, false
+	}
+}
+
+// isAPI reports whether b is the HTTP transport. Non-anthropic providers accept
+// only backend:api.
+func isAPI(b Backend) bool {
+	match b {
+	case API:
+		return true
+	case CLI:
+		return false
+	}
+}
+
+// Version is stamped by release builds. Go-installed binaries fall back to the
+// module version recorded in build info.
+var Version = "dev"
+
+const usage = `cupel — generate example, table-driven, and property-based Go tests from an
+English specification, written into a goforge component and validated against
+the goforge architecture.
+
+Usage:
+  cupel name:NAME [spec:"..."|spec-file:PATH] [key:value ...] [:flags]
+  cat spec.txt | cupel name:NAME
+
+Arguments:
+  name:NAME        target goforge component (required)
+  iface:PKG        public package name of that component (default: NAME)
+  spec:"TEXT"      inline English specification
+  spec-file:PATH   read the specification from a file
+  (stdin)          read the specification from stdin if neither is given
+  provider:WHO     model provider: anthropic (default) | openai | ollama | any
+                   custom OpenAI-compatible name (default: env CUPEL_PROVIDER)
+  backend:WHICH    transport: api (over HTTP, default) | cli (drive the local
+                   Claude Code "claude" CLI; anthropic provider only)
+  model:ID         model id (default: env CUPEL_MODEL, else a per-provider
+                   default; anthropic api uses claude-opus-4-8)
+  base-url:URL     API endpoint override (default: env CUPEL_BASE_URL, else the
+                   provider default; ollama uses http://localhost:11434/v1)
+  root:DIR         workspace root (default: discovered from the cwd)
+
+Flags:
+  :force           overwrite scaffold files (interface/internal/component.yaml)
+  :dry-run         render everything but write nothing
+  :no-check        skip running "goforge check" on the result
+  :help            print this help
+  :version         print the cupel version
+
+Providers (provider: + backend:api unless noted):
+  anthropic  Anthropic Messages API        ANTHROPIC_API_KEY
+  anthropic  + backend:cli                  local Claude Code "claude" CLI
+  openai     OpenAI / Codex Chat API        OPENAI_API_KEY
+  ollama     local Ollama                   no key; base http://localhost:11434/v1
+  <custom>   any OpenAI-compatible server   base-url: required (LM Studio, vLLM, ...)
+
+Environment:
+  CUPEL_PROVIDER      default provider (anthropic|openai|ollama|custom)
+  CUPEL_BASE_URL      default API endpoint override (all providers)
+  CUPEL_MODEL         default model id
+  ANTHROPIC_API_KEY   required for the anthropic api backend
+  OPENAI_API_KEY      key for openai (optional for local OpenAI-compatible servers)
+  CUPEL_CLAUDE_BIN    override the claude binary used by backend:cli
+`
+
+// Run is the cupel entry point. It returns a process exit code.
+func Run(args []string) int {
+	return run(args, os.Stdin, os.Stdout, os.Stderr)
+}
+
+func run(argv []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	a := parse(argv)
+
+	if a.flag("help") || a.named["name"] == "" && len(argv) == 0 {
+		fmt.Fprint(stdout, usage)
+		return 0
+	}
+	if a.flag("version") {
+		fmt.Fprintf(stdout, "cupel %s\n", resolvedVersion())
+		return 0
+	}
+	if err := validateArgs(a); err != nil {
+		fmt.Fprintf(stderr, "cupel: %v\n", err)
+		return 2
+	}
+
+	name := a.named["name"]
+	if name == "" {
+		fmt.Fprintln(stderr, "cupel: missing required argument name:NAME (try: cupel :help)")
+		return 2
+	}
+
+	text, err := specText(a, stdin)
+	if err != nil {
+		fmt.Fprintf(stderr, "cupel: %v\n", err)
+		return 1
+	}
+
+	s, err := spec.Parse(name, a.named["iface"], text)
+	if err != nil {
+		fmt.Fprintf(stderr, "cupel: %v\n", err)
+		return 1
+	}
+
+	root, module, err := workspace(a.named["root"])
+	if err != nil {
+		fmt.Fprintf(stderr, "cupel: %v\n", err)
+		return 1
+	}
+
+	cl, err := backendClient(a)
+	if err != nil {
+		fmt.Fprintf(stderr, "cupel: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stderr, "cupel: generating tests for %q via %s/%s with %s...\n", s.Name, a.provider(), a.backend(), cl.Model())
+
+	res, err := gen.Generate(context.Background(), cl, gen.Request{
+		Spec:   s,
+		Module: module,
+		Root:   root,
+		Force:  a.flag("force"),
+		DryRun: a.flag("dry-run"),
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "cupel: %v\n", err)
+		return 1
+	}
+
+	report(stdout, res, a.flag("dry-run"))
+
+	if a.flag("dry-run") || a.flag("no-check") {
+		return 0
+	}
+	return runCheck(stdout, stderr, root)
+}
+
+func report(w io.Writer, res gen.Result, dry bool) {
+	verb := "wrote"
+	if dry {
+		verb = "would write"
+	}
+	fmt.Fprintf(w, "component: %s\n", res.ComponentDir)
+	for _, p := range res.Written {
+		fmt.Fprintf(w, "  %s %s\n", verb, p)
+	}
+	for _, p := range res.Skipped {
+		fmt.Fprintf(w, "  kept existing %s\n", p)
+	}
+}
+
+// runCheck enforces the goforge architecture on the output by invoking the
+// goforge CLI if it is on PATH. A missing goforge is a hint, not a failure.
+func runCheck(stdout, stderr io.Writer, root string) int {
+	bin, err := exec.LookPath("goforge")
+	if err != nil {
+		fmt.Fprintln(stderr, "cupel: goforge not on PATH; skipping architecture check (install: go install goforge.dev/goforge@latest)")
+		return 0
+	}
+	fmt.Fprintln(stdout, "cupel: enforcing goforge architecture (goforge check)...")
+	cmd := exec.Command(bin, "check")
+	cmd.Dir = root
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(stderr, "cupel: goforge check reported problems: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// specText resolves the specification from spec:, spec-file:, or stdin.
+func specText(a args, stdin io.Reader) (string, error) {
+	if v, ok := a.named["spec"]; ok {
+		return v, nil
+	}
+	if path, ok := a.named["spec-file"]; ok {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	}
+	data, err := io.ReadAll(stdin)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(string(data)) == "" {
+		return "", fmt.Errorf("no specification given (use spec:, spec-file:, or pipe it on stdin)")
+	}
+	return string(data), nil
+}
+
+// workspace discovers the goforge workspace root and module path. If start is
+// empty it begins at the current directory and walks up to workspace.yaml.
+func workspace(start string) (root, module string, err error) {
+	if start == "" {
+		start, err = os.Getwd()
+		if err != nil {
+			return "", "", err
+		}
+	}
+	root, err = findRoot(start)
+	if err != nil {
+		return "", "", err
+	}
+	module, err = modulePath(root)
+	return root, module, err
+}
+
+func findRoot(dir string) (string, error) {
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	for {
+		if fi, err := os.Stat(filepath.Join(dir, "workspace.yaml")); err == nil && !fi.IsDir() {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("not inside a goforge workspace (no workspace.yaml found above %s)", dir)
+		}
+		dir = parent
+	}
+}
+
+// modulePath reads the module line from go.mod without pulling in x/mod.
+func modulePath(root string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	if err != nil {
+		return "", fmt.Errorf("read go.mod: %w", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "module ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "module")), nil
+		}
+	}
+	return "", fmt.Errorf("go.mod: missing module path")
+}
+
+// --- minimal poly-style argument parsing (key:value and :flag) ---
+
+type args struct {
+	named       map[string]string
+	flags       map[string]bool
+	positionals []string
+}
+
+func (a args) flag(name string) bool { return a.flags[name] }
+
+// backend returns the selected transport: "api" (default) or "cli".
+func (a args) backend() string {
+	if b := a.named["backend"]; b != "" {
+		return b
+	}
+	return "api"
+}
+
+// provider returns the selected model provider: "anthropic" (default),
+// "openai", "ollama", or any custom OpenAI-compatible name. An explicit
+// provider: argument wins over CUPEL_PROVIDER, which wins over the default.
+func (a args) provider() string {
+	if p := a.named["provider"]; p != "" {
+		return p
+	}
+	if p := strings.TrimSpace(os.Getenv("CUPEL_PROVIDER")); p != "" {
+		return p
+	}
+	return "anthropic"
+}
+
+// backendClient builds the completer for the selected provider and transport.
+// The raw backend string is retained for wire-faithful status/error text; it is
+// projected into the Backend enum only where the closed api/cli sum is dispatched.
+func backendClient(a args) (completer, error) {
+	provider := a.provider()
+	raw := a.backend()
+	b, ok := parseBackend(raw)
+
+	if provider != "anthropic" {
+		// openai, ollama, or any custom OpenAI-compatible provider.
+		if !ok || !isAPI(b) {
+			return nil, fmt.Errorf("provider %q supports only backend:api (got backend:%q)", provider, raw)
+		}
+		return openaichat.New(provider, a.named["model"], a.named["base-url"])
+	}
+
+	if !ok {
+		return nil, fmt.Errorf("unknown backend %q (want api or cli)", raw)
+	}
+	match b {
+	case API:
+		return claude.New(a.named["model"])
+	case CLI:
+		return claudecode.New(a.named["model"])
+	}
+}
+
+func parse(argv []string) args {
+	a := args{named: map[string]string{}, flags: map[string]bool{}}
+	for _, tok := range argv {
+		switch {
+		case tok == "help" || tok == "-h" || tok == "--help":
+			a.flags["help"] = true
+		case tok == "version" || tok == "-v" || tok == "--version":
+			a.flags["version"] = true
+		case strings.HasPrefix(tok, ":"):
+			a.flags[tok[1:]] = true
+		case strings.Contains(tok, ":"):
+			k, v, _ := strings.Cut(tok, ":")
+			a.named[k] = v
+		default:
+			a.positionals = append(a.positionals, tok)
+		}
+	}
+	return a
+}
+
+func resolvedVersion() string {
+	if Version != "dev" {
+		return Version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return Version
+}
+
+func validateArgs(a args) error {
+	if len(a.positionals) > 0 {
+		return fmt.Errorf("unexpected argument %q (arguments use key:value or :flag syntax; try: cupel :help)", a.positionals[0])
+	}
+	knownNamed := map[string]bool{
+		"backend":   true,
+		"base-url":  true,
+		"iface":     true,
+		"model":     true,
+		"name":      true,
+		"provider":  true,
+		"root":      true,
+		"spec":      true,
+		"spec-file": true,
+	}
+	knownFlags := map[string]bool{
+		"dry-run":  true,
+		"force":    true,
+		"help":     true,
+		"no-check": true,
+		"version":  true,
+	}
+	for _, k := range sortedKeys(a.named) {
+		if !knownNamed[k] {
+			return fmt.Errorf("unknown argument %q (try: cupel :help)", k+":")
+		}
+	}
+	for _, f := range sortedKeys(a.flags) {
+		if !knownFlags[f] {
+			return fmt.Errorf("unknown flag %q (try: cupel :help)", ":"+f)
+		}
+	}
+	return nil
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
